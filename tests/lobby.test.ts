@@ -105,6 +105,34 @@ test('waiting room can be dissolved without a hand or charging anyone',()=>{
   } finally {f.store.db.close();}
 });
 
+test('chosen seats are exclusive; stale, occupied and invalid seat requests never charge points',()=>{
+  const f=fixture(4);try {
+    f.create({maxPlayers:6});const before=f.room.state.version;
+    f.cmd(0,'sit',{seat:4,amount:2000});
+    assert.equal(f.room.state.seats[0].seat,4);
+    assert.throws(()=>f.room.command(f.users[1].id,crypto.randomUUID(),before,'sit',{seat:4,amount:2000}),/更新/);
+    assert.throws(()=>f.cmd(1,'sit',{seat:4,amount:2000}),/已有人/);
+    for(const seat of [-1,6,11,1.5,'2',null])assert.throws(()=>f.cmd(1,'sit',{seat,amount:2000}),/座位编号/);
+    assert.equal(f.store.user(f.users[1].id)?.balance,100000);
+    assert.equal(f.room.state.match?.players.length,1);
+    f.cmd(1,'sit',{seat:1,amount:2000});f.cmd(2,'sit',{seat:5,amount:2000});
+    assert.throws(()=>f.cmd(0,'settings',{maxPlayers:3}),/座位仍有人/);
+    assert.equal(f.room.state.config.maxPlayers,6);
+    f.cmd(0,'start');f.cmd(0,'pause');
+    assert.deepEqual(f.room.state.hand?.players.map(p=>p.seat),[1,4,5]);
+    assert.equal(f.room.state.hand?.actor,f.users[1].id);
+    assert.throws(()=>f.cmd(3,'sit',{seat:0,amount:2000}),/本手结束/);
+    f.foldHand();f.cmd(1,'leave');
+    assert.deepEqual(f.room.state.seats.map(p=>p.seat),[4,5]);
+    f.cmd(3,'sit',{seat:1,amount:2000});
+    assert.equal(f.room.state.seats.find(p=>p.id===f.users[3].id)?.seat,1);
+    assert.equal(f.room.state.seats.find(p=>p.id===f.users[0].id)?.seat,4);
+    const restarted=new Room(f.store);
+    assert.deepEqual(restarted.state.seats.map(p=>p.seat),[4,5,1]);
+    assert.equal(f.store.users().reduce((n,u)=>n+u.balance,0)+restarted.state.seats.reduce((n,p)=>n+p.stack,0),400000);
+  } finally {f.store.db.close();}
+});
+
 test('restart retains match deadline and safely closes expired paused match; old fixed table migrates without chip loss',()=>{
   const f=fixture(2);try {
     f.create();f.sit(0);f.sit(1);f.cmd(0,'start');f.cmd(0,'pause');f.foldHand();

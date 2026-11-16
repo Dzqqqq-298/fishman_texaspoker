@@ -100,10 +100,13 @@ export class Room {
       if(s.squid)throw new Error('鱿鱼本轮结束后才能加入');
       if(s.seats.some(p=>p.id===id))throw new Error('你已经入座');
       if(s.seats.length>=s.config.maxPlayers)throw new Error('座位已满');
+      const seat=data.seat===undefined?Array.from({length:s.config.maxPlayers},(_,i)=>i).find(i=>!s.seats.some(p=>p.seat===i)):data.seat;
+      if(typeof seat!=='number'||!Number.isInteger(seat)||seat<0||seat>=s.config.maxPlayers)throw new Error('座位编号无效');
+      if(s.seats.some(p=>p.seat===seat))throw new Error('该座位已有人，请选择其他空座');
       const amount=this.amount(data.amount);
       if(amount<s.config.minBuyIn||amount>s.config.maxBuyIn)throw new Error(`带入范围为 ${s.config.minBuyIn}～${s.config.maxBuyIn}`);
       this.store.balance(id,-amount,'带入');this.addBuyIn(id,amount);
-      const user=this.store.user(id)!,seat=Array.from({length:11},(_,i)=>i).find(i=>!s.seats.some(p=>p.seat===i))!;
+      const user=this.store.user(id)!;
       s.seats.push({id,name:user.name,seat,stack:amount,straddle:false,sittingOut:false,timeouts:0});
       this.note(`${user.name} 带入 ${amount}，加入牌桌`);
     } else if(type==='topup') {
@@ -141,6 +144,7 @@ export class Room {
       if(s.match.startedAt!==null)throw new Error('开赛后房间规则锁定，请结束后重新创建房间');
       const config=this.readConfig(data,s.config);
       if(s.seats.length>config.maxPlayers)throw new Error('人数上限不能低于已入座人数');
+      if(s.seats.some(p=>p.seat>=config.maxPlayers))throw new Error('需关闭的座位仍有人，请先离座再调整人数');
       if(s.seats.some(p=>p.stack<config.minBuyIn||p.stack>config.maxBuyIn))throw new Error('新的带入范围不包含已有玩家筹码，请先让玩家调整或离座');
       s.config=config;this.note('房主已更新开赛规则，请入座玩家确认');
     } else if(type==='squidEnd') {

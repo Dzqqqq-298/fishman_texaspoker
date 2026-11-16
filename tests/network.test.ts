@@ -35,8 +35,9 @@ test('real HTTP + 11 WebSocket clients: authentication, private cards, complete 
         assert.ok(created.ok,created.error);await until(()=>!!states.get(i)!.match);
       }
       const state=states.get(i)!;
-      const ack=await socket.timeout(5000).emitWithAck('command',{key:crypto.randomUUID(),version:state.version,type:'sit',data:{amount:2000}});assert.ok(ack.ok,ack.error);
+      const ack=await socket.timeout(5000).emitWithAck('command',{key:crypto.randomUUID(),version:state.version,type:'sit',data:{amount:2000,seat:(i*7)%11}});assert.ok(ack.ok,ack.error);
       await until(()=>states.get(i)!.seats.length===i+1);
+      assert.equal(states.get(i)!.seats.find(p=>p.id===state.me.id)?.seat,(i*7)%11);
     }
     await until(()=>states.get(0)!.seats.length===11);
     const send=async(index:number,type:string,data:Record<string,unknown>={})=>{
@@ -61,6 +62,7 @@ test('real HTTP + 11 WebSocket clients: authentication, private cards, complete 
     let restored:RoomView|undefined;reconnected.on('state',(s:RoomView)=>{restored=s;states.set(0,s);});await until(()=>!!restored);
     assert.equal(restored!.me.id,id);assert.equal(restored!.hand!.id,result.hand!.id);
     assert.equal(restored!.seats.length,11);
+    assert.deepEqual(restored!.seats.map(p=>p.seat),result.seats.map(p=>p.seat));
     sockets[0]=reconnected;
     await send(0,'endRoom');
     assert.ok([...states.values()].every(s=>s.match===null&&s.seats.length===0));
