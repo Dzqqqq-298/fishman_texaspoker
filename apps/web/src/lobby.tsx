@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { HandHistory } from './hand-history';
 import type { RoomView } from '../../server/room';
 import { DEFAULT_ROOM_CONFIG, type RoomConfig, type MatchResult } from '../../../packages/game-engine/room-config';
 
@@ -34,6 +35,8 @@ export function RoomSetupForm({initial,name,edit=false,busy,onSubmit,onCancel}:{
       <label>连续 Straddle<select value={config.straddleMax} onChange={e=>update('straddleMax',Number(e.target.value))}>{[0,2,4,8,16].map(n=><option key={n} value={n}>{n?`接力最高 ${n}BB`:'关闭'}</option>)}</select></label>
       <label className="setting-toggle"><span><b>鱿鱼</b><small>赢主池得标记，最后无标记者付分。</small></span><input type="checkbox" checked={config.squidEnabled} onChange={e=>update('squidEnabled',e.target.checked)}/></label>
       {config.squidEnabled&&<label>向每位有标记者支付<input type="number" required min={1} max={10000} value={config.squidUnit} onChange={e=>update('squidUnit',Number(e.target.value))}/><small className="field-help">至少 3 人；每人最多预留 {(config.maxPlayers-1)*config.squidUnit} 积分。</small></label>}
+      <label>All-in 发牌<select value={config.maxRunouts} onChange={e=>update('maxRunouts',Number(e.target.value) as 1|2)}><option value={1}>只发一次</option><option value={2}>两人协商，最多两次</option></select><small className="field-help">三人及以上只发一次；两人需双方同意。</small></label>
+      <label>普通比牌<select value={config.showdownMode} onChange={e=>update('showdownMode',e.target.value as 'auto'|'all')}><option value="auto">按顺序亮牌，输家自动盖牌</option><option value="all">所有参与比牌者亮牌</option></select><small className="field-help">All-in 下注结束后强制亮牌；弃牌不自动亮牌。</small></label>
       <div className="fixed-rule"><span>行动时间 <b>25 秒</b></span><span>时间卡 <b>每张 +30 秒</b></span></div>
     </section>
     <details className="setup-section advanced"><summary>高级选项</summary><div className="advanced-content">
@@ -46,7 +49,8 @@ export function RoomSetupForm({initial,name,edit=false,busy,onSubmit,onCancel}:{
 }
 
 function Results({match,me}:{match:MatchResult;me:number}) {
-  return <details className="match-result"><summary><span><b>{match.name}</b><small>{new Date(match.endedAt).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false})} · {match.handCount} 手</small></span><span className="tag">{match.reason}</span></summary><div className="results-scroll"><table><thead><tr><th>玩家</th><th>累计带入</th><th>退回筹码</th><th>鱿鱼盈亏</th><th>总盈亏</th></tr></thead><tbody>{match.players.length?match.players.map(p=><tr key={p.id}><td>{p.name}{p.id===me?' · 我':''}</td><td>{num(p.buyIn)}</td><td>{num(p.cashOut)}</td><td>{p.squidProfit>0?'+':''}{num(p.squidProfit)}</td><td className={p.profit>=0?'positive':'negative'}>{p.profit>0?'+':''}{num(p.profit)}</td></tr>):<tr><td colSpan={5}>无带入记录</td></tr>}</tbody></table></div></details>;
+  const [history,setHistory]=useState(false);
+  return <details className="match-result"><summary><span><b>{match.name}</b><small>{new Date(match.endedAt).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false})} · {match.handCount} 手</small></span><span className="tag">{match.reason}</span></summary><div className="results-scroll"><table><thead><tr><th>玩家</th><th>累计带入</th><th>退回筹码</th><th>鱿鱼盈亏</th><th>总盈亏</th></tr></thead><tbody>{match.players.length?match.players.map(p=><tr key={p.id}><td>{p.name}{p.id===me?' · 我':''}</td><td>{num(p.buyIn)}</td><td>{num(p.cashOut)}</td><td>{p.squidProfit>0?'+':''}{num(p.squidProfit)}</td><td className={p.profit>=0?'positive':'negative'}>{p.profit>0?'+':''}{num(p.profit)}</td></tr>):<tr><td colSpan={5}>无带入记录</td></tr>}</tbody></table></div><button className="wide" aria-expanded={history} onClick={()=>setHistory(v=>!v)}>{history?'收起牌谱':'本场牌谱'}</button>{history&&<HandHistory matchId={match.id}/>}</details>;
 }
 
 export function Lobby({room,now,disabled,onCreate,onEnter,onEnd,accountPanel}:{room:RoomView;now:number;disabled:boolean;onCreate:()=>void;onEnter:()=>void;onEnd:()=>void;accountPanel:React.ReactNode}) {

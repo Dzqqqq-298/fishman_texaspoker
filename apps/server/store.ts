@@ -3,6 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomBytes, scryptSync, timingSafeEqual, createHash } from 'node:crypto';
 import type { MatchResult } from '../../packages/game-engine/room-config';
+import type { HandRecord } from '../../packages/game-engine/records';
 
 export type User = { id:number; username:string; name:string; password:string; admin:number; balance:number; timeCards:number; hands:number };
 export function hashPassword(password:string) {const salt=randomBytes(16).toString('hex');return `${salt}:${scryptSync(password,salt,64).toString('hex')}`;}
@@ -49,6 +50,13 @@ export class Store {
   recent(id:number) {return this.db.prepare('SELECT amount,kind,at FROM ledger WHERE userId=? ORDER BY id DESC LIMIT 30').all();}
   saveMatch(result:MatchResult) {this.db.prepare('INSERT INTO matches VALUES(?,?,?)').run(result.id,JSON.stringify(result),result.endedAt);}
   recentMatches():MatchResult[] {return (this.db.prepare('SELECT summary FROM matches ORDER BY endedAt DESC, rowid DESC LIMIT 5').all() as {summary:string}[]).map(r=>JSON.parse(r.summary));}
+  saveHand(hand:HandRecord) {this.db.prepare('INSERT INTO hands(id,summary) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET summary=excluded.summary').run(hand.id,JSON.stringify(hand));}
+  handHistory(matchId:string,before=Number.MAX_SAFE_INTEGER) {
+    const rows=this.db.prepare("SELECT rowid AS cursor,summary FROM hands WHERE json_extract(summary,'$.matchId')=? AND rowid<? ORDER BY rowid DESC LIMIT 50").all(matchId,before) as {cursor:number;summary:string}[];
+    // Explicit allowlist also prevents legacy or future private fields leaking into history.
+    return rows.map(({cursor,summary})=>{const h=JSON.parse(summary);return {cursor,id:h.id,matchId:h.matchId,number:h.number??0,completedAt:h.completedAt??0,board:h.board,boards:h.boards??[h.board],pots:h.pots,log:h.log,
+      players:h.players.map((p:HandRecord['players'][number])=>({id:p.id,name:p.name,seat:p.seat,publicCards:p.publicCards??[null,null],stack:p.stack,contributed:p.contributed??0,profit:p.profit??0,folded:p.folded??false}))} as HandRecord&{cursor:number};});
+  }
   load<T>() {const row=this.db.prepare('SELECT state FROM room WHERE id=1').get() as {state:string}|undefined;return row?JSON.parse(row.state) as T:null;}
   save(state:unknown) {this.db.prepare('INSERT INTO room VALUES(1,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state').run(JSON.stringify(state));}
   transaction<T>(fn:()=>T) {this.db.exec('BEGIN IMMEDIATE');try{const result=fn();this.db.exec('COMMIT');return result;}catch(error){this.db.exec('ROLLBACK');throw error;}}

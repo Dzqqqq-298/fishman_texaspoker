@@ -47,6 +47,12 @@ app.use('/api',(req,res,next)=>{const user=store.session(cookie(req.headers.cook
 app.get('/api/me',(_req,res)=>res.json({user:store.publicUser(res.locals.user)}));
 app.get('/api/room',(_req,res)=>res.json(room.view(res.locals.user.id)));
 app.get('/api/ledger',(_req,res)=>res.json(store.recent(res.locals.user.id)));
+app.get('/api/hands',(req,res)=>{
+  const matchId=typeof req.query.matchId==='string'?req.query.matchId:room.state.match?.id;
+  const before=req.query.before===undefined?Number.MAX_SAFE_INTEGER:Number(req.query.before);
+  if(!matchId||matchId.length>80||!Number.isSafeInteger(before)||before<1){res.status(400).json({error:'牌谱查询参数无效'});return;}
+  const hands=store.handHistory(matchId,before);res.json({hands,nextCursor:hands.length===50?hands.at(-1)!.cursor:null});
+});
 app.post('/api/logout',(req,res)=>{store.logout(cookie(req.headers.cookie));connections.get(res.locals.user.id)?.disconnect(true);res.clearCookie('fishman_session',{path:'/'});res.json({ok:true});});
 app.post('/api/admin/users',(req,res)=>{
   if(!res.locals.user.admin){res.status(403).json({error:'需要管理员权限'});return;}

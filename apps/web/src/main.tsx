@@ -5,6 +5,8 @@ import type { RoomView } from '../../server/room';
 import { Lobby, RoomSetupForm } from './lobby';
 import { Card } from './card';
 import { PokerTable } from './table';
+import { Settlement } from './settlement';
+import type { MatchResult } from '../../../packages/game-engine/room-config';
 import './style.css';
 import './lobby.css';
 
@@ -22,6 +24,8 @@ function App(){
   const [page,setPage]=useState<'lobby'|'table'|'create'|'settings'>('lobby');
   const [user,setUser]=useState<RoomView['me']|null>(null),[loading,setLoading]=useState(true),[room,setRoom]=useState<RoomView|null>(null);
   const [error,setError]=useState(''),[connected,setConnected]=useState(false),[busy,setBusy]=useState(false);
+  const [settlement,setSettlement]=useState<MatchResult|null>(null);
+  const activeMatch=useRef<string|null>(null);
   const [clock,setClock]=useState(Date.now());
   const socket=useRef<Socket|null>(null),offset=useRef(0);
   useEffect(()=>{request('me').then(d=>setUser(d.user)).catch(()=>{}).finally(()=>setLoading(false));},[]);
@@ -30,7 +34,7 @@ function App(){
     const s=io({transports:['websocket','polling']});socket.current=s;
     s.on('connect',()=>{setConnected(true);setError('');});s.on('disconnect',()=>setConnected(false));
     s.on('connect_error',()=>setError('连接暂时中断，正在尝试重连；若已在其他设备登录，请重新登录。'));
-    s.on('state',(state:RoomView)=>{offset.current=state.serverNow-Date.now();setRoom(state);});
+    s.on('state',(state:RoomView)=>{offset.current=state.serverNow-Date.now();if(activeMatch.current&&!state.match){const result=state.recentMatches.find(m=>m.id===activeMatch.current);if(result)setSettlement(result);}activeMatch.current=state.match?.id??null;setRoom(state);});
     return()=>{s.disconnect();socket.current=null;};
   },[user?.id]);
   useEffect(()=>{const t=setInterval(()=>setClock(Date.now()),250);return()=>clearInterval(t);},[]);
@@ -41,7 +45,7 @@ function App(){
     try{const ack=await socket.current.timeout(7000).emitWithAck('command',{key:globalThis.crypto?.randomUUID?.()??`${Date.now()}-${Math.random()}`,version:room.version,type,data});if(!ack.ok)throw new Error(ack.error);return true;}
     catch(e){setError(e instanceof Error?e.message:'请求失败，请等待牌桌同步后再操作');return false;}finally{setBusy(false);}
   }
-  async function logout(){await request('logout',{});setUser(null);setRoom(null);setError('');setPage('lobby');}
+  async function logout(){await request('logout',{});setUser(null);setRoom(null);setError('');setPage('lobby');setSettlement(null);activeMatch.current=null;}
   if(loading)return <div className="loading">正在连接牌桌…</div>;
   if(!user)return <main className="login-layout">
     <div className="brand"><Mark/><span>鱼人德州<small>FISHMAN POKER CLUB</small></span></div>
@@ -59,9 +63,10 @@ function App(){
   const player=hand?.players.find(p=>p.id===me.id);
   const disabled=busy||!connected;
   const endRoom=()=>{if(window.confirm(playing?'确定结束比赛？当前手会继续，结束后结算鱿鱼、退回筹码并关闭房间。':'确定关闭房间？将结算鱿鱼、退回所有筹码并保存战绩。'))void command('endRoom');};
-  const header=<header className="topbar"><div className="brand"><Mark/><span>鱼人德州</span></div><button className="quiet" onClick={()=>{setPage('lobby');setError('');}}>大厅</button>{room?.match&&page!=='table'&&<button className="quiet" onClick={()=>setPage('table')}>牌桌</button>}<div className="connection"><i className={connected?'online':''}/>{connected?'已连接':'正在重连'}</div><details className="profile"><summary>我的</summary><div className="profile-card"><b>{me.name}</b><dl><div><dt>账户积分</dt><dd>{number(me.balance)}</dd></div><div><dt>桌上筹码</dt><dd>{number(playing&&player?player.stack:seat?.stack??0)}</dd></div><div><dt>时间卡</dt><dd>{me.timeCards} 张</dd></div></dl><small>每日 04:00 重置至 100,000</small><button className="quiet" onClick={logout}>退出登录</button></div></details></header>;
+  const header=<header className="topbar"><div className="brand"><Mark/><span>鱼人德州</span></div><button className="quiet" onClick={()=>{setPage('lobby');setSettlement(null);setError('');}}>大厅</button>{room?.match&&page!=='table'&&<button className="quiet" onClick={()=>setPage('table')}>牌桌</button>}<div className="connection"><i className={connected?'online':''}/>{connected?'已连接':'正在重连'}</div><details className="profile"><summary>我的</summary><div className="profile-card"><b>{me.name}</b><dl><div><dt>账户积分</dt><dd>{number(me.balance)}</dd></div><div><dt>桌上筹码</dt><dd>{number(playing&&player?player.stack:seat?.stack??0)}</dd></div><div><dt>时间卡</dt><dd>{me.timeCards} 张</dd></div></dl><small>每日 04:00 重置至 100,000</small><button className="quiet" onClick={logout}>退出登录</button></div></details></header>;
   const accountPanel=!!me.admin&&<AccountCreator/>;
   if(!room)return <div className="club">{header}<div className="loading">正在同步大厅…</div></div>;
+  if(settlement)return <div className="club">{header}<Settlement result={settlement} room={room} now={clock+offset.current} disabled={disabled} error={error} command={command} onClose={()=>{setSettlement(null);setPage('lobby');}}/></div>;
   if(page!=='table'||!room.match)return <div className="club">{header}{error&&<p className="error lobby-error" role="alert">{error}</p>}
     {page==='create'&&!room.match?<RoomSetupForm name={`${me.name}的好友局`} busy={disabled} onCancel={()=>setPage('lobby')} onSubmit={async data=>{if(await command('createRoom',data)){setPage('table');}}}/>:
       page==='settings'&&room.match&&host?<RoomSetupForm name={room.match.name} initial={room.config} edit busy={disabled||room.match.startedAt!==null} onCancel={()=>setPage('table')} onSubmit={async data=>{if(await command('settings',data))setPage('table');}}/>:

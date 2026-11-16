@@ -1,6 +1,7 @@
 import { Holdem, type HandState } from '../../packages/game-engine/holdem';
 import { DEFAULT_ROOM_CONFIG, type RoomConfig, type MatchSession, type MatchResult } from '../../packages/game-engine/room-config';
 import { Store } from './store';
+import type { HandRecord, ChatMessage } from '../../packages/game-engine/records';
 
 interface Seat {id:number;name:string;seat:number;stack:number;straddle:boolean;sittingOut:boolean;timeouts:number}
 interface Squid {unit:number;participants:number[];marked:number[];reserve:number}
@@ -8,6 +9,7 @@ interface State {
   version:number; day:string; hostId:number|null; seats:Seat[]; hand:HandState|null; running:boolean; pausedForRecovery:boolean;
   button:number; deadline:number; nextDeal:number; timeArmed:number|null; timeExtended:boolean;
   config:RoomConfig; match:MatchSession|null; squid:Squid|null; notices:string[];
+  chat:ChatMessage[];lastCompleted:{hand:HandState;matchId:string;number:number;completedAt:number;expiresAt:number}|null;
 }
 export function gameDay(now=Date.now()) {return new Date(now+4*3600000).toISOString().slice(0,10);}
 const playing=(s:State)=>!!s.hand&&s.hand.street!=='finished';
@@ -20,10 +22,11 @@ export class Room {
     this.state=store.load<State>()??{
       version:0,day:gameDay(),hostId:null,seats:[],hand:null,running:false,pausedForRecovery:false,
       button:-1,deadline:0,nextDeal:0,timeArmed:null,timeExtended:false,
-      config:{...DEFAULT_ROOM_CONFIG},match:null,squid:null,notices:['欢迎来到鱼人大厅，创建房间或加入朋友的牌局。'],
+      config:{...DEFAULT_ROOM_CONFIG},match:null,squid:null,notices:['欢迎来到鱼人大厅，创建房间或加入朋友的牌局。'],chat:[],lastCompleted:null,
     };
     const s=this.state;
     s.config={...DEFAULT_ROOM_CONFIG,...s.config};
+    s.chat??=[];s.lastCompleted??=null;if(s.hand)Holdem.restore(s.hand);if(s.lastCompleted)Holdem.restore(s.lastCompleted.hand);
     // Upgrade the original always-open table without discarding chips or an active hand.
     if(s.match===undefined) {
       s.match=s.seats.length||s.hand?{
@@ -46,15 +49,15 @@ export class Room {
   private host(id:number) {if(this.state.hostId!==id&&!this.store.user(id)?.admin)throw new Error('只有房主或管理员可以操作');}
   private seat(id:number) {const seat=this.state.seats.find(s=>s.id===id);if(!seat)throw new Error('请先入座');return seat;}
   private between() {if(playing(this.state))throw new Error('请在本手结束后操作');}
-  private atomic(fn:()=>void) {
+  private atomic(fn:()=>void,versioned=true) {
     const backup=structuredClone(this.state);
-    try {this.store.transaction(()=>{fn();this.state.version++;this.store.save(this.state);});}
+    try {this.store.transaction(()=>{fn();if(versioned)this.state.version++;this.store.save(this.state);});}
     catch(error) {this.state=backup;throw error;}
   }
   command(id:number,key:string,version:number,type:string,data:Record<string,unknown>={}) {
     if(this.store.seen(id,key))return;
-    if(version!==this.state.version)throw new Error('牌桌已更新，请重新操作');
-    this.atomic(()=>{this.apply(id,type,data);this.store.remember(id,key);});
+    if(!['chat','showCards','runoutVote'].includes(type)&&version!==this.state.version)throw new Error('牌桌已更新，请重新操作');
+    this.atomic(()=>{this.apply(id,type,data);this.store.remember(id,key);},type!=='chat');
   }
   private amount(value:unknown) {
     if(typeof value!=='number'||!Number.isSafeInteger(value)||value<1||value>1000000000)throw new Error('请输入有效的整数积分');
@@ -66,6 +69,7 @@ export class Room {
     if(c.smallBlind>c.bigBlind||c.bigBlind>10000||c.squidUnit>10000)throw new Error('盲注或鱿鱼额度不合法');
     if(!Number.isInteger(c.maxPlayers)||c.maxPlayers<2||c.maxPlayers>11)throw new Error('人数上限应为 2～11 人');
     if(![0,2,4,8,16].includes(c.straddleMax))throw new Error('Straddle 上限不合法');
+    if(![1,2].includes(c.maxRunouts)||!['auto','all'].includes(c.showdownMode))throw new Error('发牌次数或秀牌规则无效');
     if(!Number.isInteger(c.durationMinutes)||(c.durationMinutes!==0&&(c.durationMinutes<15||c.durationMinutes>720)))throw new Error('时长应为 15～720 分钟，或选择不限时');
     if(c.minBuyIn<c.bigBlind||c.minBuyIn>c.defaultBuyIn||c.defaultBuyIn>c.maxBuyIn)throw new Error('带入范围应满足：大盲 ≤ 最低带入 ≤ 默认带入 ≤ 最高带入');
     if([c.squidEnabled,c.allowTopup,c.allowLateJoin].some(v=>typeof v!=='boolean'))throw new Error('规则开关不合法');
@@ -79,20 +83,36 @@ export class Room {
   }
   private apply(id:number,type:string,data:Record<string,unknown>) {
     const s=this.state;
+    if(type==='showCards') {
+      const last=s.lastCompleted;
+      if(!last||last.hand.id!==data.handId||Date.now()>last.expiresAt||playing(s))throw new Error('本手秀牌时间已结束');
+      if(!Array.isArray(data.indices))throw new Error('请选择底牌');
+      const h=Holdem.restore(last.hand);h.showCards(id,data.indices as number[]);
+      if(s.hand?.id===h.state.id)s.hand=h.state;
+      this.saveHandRecord(last);return;
+    }
     if(type==='createRoom') {
       if(s.match)throw new Error('已有房间，请等待当前房间结束后再创建');
       if(typeof data.name!=='string'||!data.name.trim()||data.name.trim().length>24)throw new Error('房间名称需 1～24 个字符');
       s.config=this.readConfig(data);
       s.match={id:crypto.randomUUID(),name:data.name.trim(),createdAt:Date.now(),startedAt:null,endsAt:null,endRequested:false,endReason:null,handCount:0,players:[]};
       s.hostId=id;s.button=-1;s.seats=[];s.hand=null;s.running=false;s.pausedForRecovery=false;
-      s.deadline=0;s.timeArmed=null;s.timeExtended=false;s.squid=null;
+      s.deadline=0;s.timeArmed=null;s.timeExtended=false;s.squid=null;s.chat=[];
       s.notices=[`${this.store.user(id)!.name} 创建了房间「${s.match.name}」，等待入座。`];
       return;
     }
     if(!s.match)throw new Error('当前没有房间，请先在大厅创建房间');
-    if(s.match.endRequested&&!['action','time','start','endRoom'].includes(type))throw new Error('房间正在收尾，本手结束后结算');
+    if(s.match.endRequested&&!['action','time','start','endRoom','runoutVote','chat'].includes(type))throw new Error('房间正在收尾，本手结束后结算');
 
-    if(type==='endRoom') {
+    if(type==='chat') {
+      if(playing(s)&&s.hand!.players.find(p=>p.id===id)?.allIn)throw new Error('All-in 后本手结束前禁言');
+      if(typeof data.text!=='string'||!data.text.trim()||data.text.trim().length>200)throw new Error('消息需 1～200 字');
+      const previous=[...s.chat].reverse().find(m=>m.userId===id);if(previous&&Date.now()-previous.at<800)throw new Error('发送太快，请稍后');
+      s.chat=[...s.chat.slice(-49),{id:crypto.randomUUID(),userId:id,name:this.store.user(id)!.name,text:data.text.trim(),at:Date.now()}];
+    } else if(type==='runoutVote') {
+      if(s.pausedForRecovery||!s.hand||s.hand.id!==data.handId||s.hand.street!=='runout'||Date.now()>=s.deadline)throw new Error('发牌选择已结束');
+      const h=Holdem.restore(s.hand);h.voteRunout(id,data.count as 1|2);if(h.state.street==='finished')this.finishHand();
+    } else if(type==='endRoom') {
       this.host(id);this.requestEnd('房主手动结束');
     } else if(type==='sit') {
       this.between();
@@ -128,7 +148,7 @@ export class Room {
       this.host(id);
       if(s.pausedForRecovery&&playing(s)) {
         s.pausedForRecovery=false;s.running=!s.match.endRequested;
-        s.deadline=Date.now()+25000;s.timeArmed=null;s.timeExtended=false;this.note('房主已恢复牌局');
+        s.deadline=Date.now()+(s.hand!.street==='runout'?10000:25000);s.timeArmed=null;s.timeExtended=false;this.note('房主已恢复牌局');
       } else {
         this.between();if(s.match.endRequested)throw new Error('房间正在结束');
         if(s.match.startedAt===null) {
@@ -173,13 +193,14 @@ export class Room {
       s.squid={unit:s.config.squidUnit,participants:entries.map(p=>p.id),marked:[],reserve};
     }
     s.button=(entries.find(p=>p.seat>s.button)??entries[0]).seat;
-    s.hand=new Holdem(entries,s.button,s.config.smallBlind,s.config.bigBlind,s.config.straddleMax).state;
-    s.deadline=Date.now()+25000;s.timeArmed=null;s.timeExtended=false;
+    s.lastCompleted=null;
+    s.hand=new Holdem(entries,s.button,s.config.smallBlind,s.config.bigBlind,s.config.straddleMax,crypto.randomUUID(),s.config.maxRunouts,s.config.showdownMode).state;
+    s.deadline=Date.now()+(s.hand.street==='runout'?10000:25000);s.timeArmed=null;s.timeExtended=false;
     if(s.hand.street==='finished')this.finishHand();
   }
   private action(id:number,type:'fold'|'check'|'call'|'raise',amount?:number) {
     const s=this.state,h=Holdem.restore(s.hand!);h.act(id,type,amount);s.hand=h.state;
-    s.deadline=Date.now()+25000;s.timeArmed=null;s.timeExtended=false;
+    s.deadline=Date.now()+(s.hand.street==='runout'?10000:25000);s.timeArmed=null;s.timeExtended=false;
     if(s.hand.street==='finished')this.finishHand();
   }
   private finishHand() {
@@ -190,16 +211,26 @@ export class Room {
       this.store.db.prepare('UPDATE users SET hands=hands+1,timeCards=MIN(3,timeCards+CASE WHEN (hands+1)%20=0 THEN 1 ELSE 0 END) WHERE id=?').run(p.id);
     });
     m.handCount++;
-    const main=h.pots.find(p=>!p.returned);
-    if(s.squid&&main?.winners.length===1&&s.squid.participants.includes(main.winners[0])) {
+    const mains=h.boards.length>1?h.pots.filter(p=>!p.returned&&p.potIndex===0):h.pots.filter(p=>!p.returned).slice(0,1);
+    const main=mains[0];
+    if(s.squid&&main?.winners.length===1&&mains.every(p=>p.winners.length===1&&p.winners[0]===main.winners[0])&&s.squid.participants.includes(main.winners[0])) {
       if(!s.squid.marked.includes(main.winners[0]))s.squid.marked.push(main.winners[0]);
       if(s.squid.marked.length===s.squid.participants.length-1)this.finishSquid();
     }
-    const summary={id:h.id,matchId:m.id,board:h.board,pots:h.pots,players:h.players.map(p=>({id:p.id,name:p.name,stack:p.stack})),log:h.log};
-    this.store.db.prepare('INSERT INTO hands(id,summary) VALUES(?,?)').run(h.id,JSON.stringify(summary));
-    s.nextDeal=Date.now()+7000;s.deadline=0;
+    s.lastCompleted={hand:h,matchId:m.id,number:m.handCount,completedAt:Date.now(),expiresAt:Date.now()+10000};
+    this.saveHandRecord(s.lastCompleted);
+    s.nextDeal=Date.now()+10000;s.deadline=0;
     if(m.endRequested)this.finishMatch(m.endReason??'房主手动结束');
     else if(m.endsAt!==null&&Date.now()>=m.endsAt)this.finishMatch('比赛时长到期');
+  }
+  private saveHandRecord(last:NonNullable<State['lastCompleted']>) {
+    const h=Holdem.restore(last.hand).view(0);
+    const summary:HandRecord={id:h.id,matchId:last.matchId,number:last.number,completedAt:last.completedAt,board:h.board,boards:h.boards.length?h.boards:[h.board],pots:h.pots,log:h.log,
+      players:h.players.map(p=>({id:p.id,name:p.name,seat:p.seat,publicCards:p.publicCards,stack:p.stack,contributed:p.total,profit:h.pots.filter(pot=>pot.winners.includes(p.id)).reduce((n,pot)=>{
+        const winners=pot.winners.map(id=>h.players.find(p=>p.id===id)!).sort((a,b)=>((a.seat-h.button+11)%11||11)-((b.seat-h.button+11)%11||11));
+        return n+Math.floor(pot.amount/winners.length)+(winners.findIndex(w=>w.id===p.id)<pot.amount%winners.length?1:0);
+      },0)-p.total,folded:p.folded}))};
+    this.store.saveHand(summary);
   }
   private finishSquid() {
     const s=this.state,q=s.squid;if(!q)return;
@@ -240,6 +271,7 @@ export class Room {
       this.atomic(()=>this.requestEnd('比赛时长到期'));return true;
     }
     if(s.pausedForRecovery)return false;
+    if(s.lastCompleted&&now>s.lastCompleted.expiresAt){this.atomic(()=>{s.lastCompleted=null;});return true;}
     if(s.day!==gameDay(now)&&!playing(s)) {
       this.atomic(()=>{
         if(s.match)this.finishMatch('每日积分重置');
@@ -250,6 +282,7 @@ export class Room {
     }
     if(playing(s)&&now>=s.deadline) {
       this.atomic(()=>{
+        if(s.hand!.street==='runout'){Holdem.restore(s.hand!).completeRunout(1);this.finishHand();return;}
         const id=s.hand!.actor!;
         if(s.timeArmed===id&&!s.timeExtended&&this.store.user(id)!.timeCards>0) {
           this.store.db.prepare('UPDATE users SET timeCards=timeCards-1 WHERE id=?').run(id);s.timeExtended=true;s.timeArmed=null;s.deadline=now+30000;
@@ -273,6 +306,8 @@ export class Room {
       version:s.version,day:s.day,hostId:s.hostId,hostName:s.hostId?this.store.user(s.hostId)?.name??null:null,running:s.running,pausedForRecovery:s.pausedForRecovery,
       deadline:s.deadline,timeArmed:s.timeArmed,timeExtended:s.timeExtended,serverNow:Date.now(),
       phase,match:s.match,recentMatches:this.store.recentMatches(),
+      chat:s.chat,chatBlocked:playing(s)&&!!s.hand?.players.find(p=>p.id===id)?.allIn,
+      lastCompleted:s.lastCompleted?{matchId:s.lastCompleted.matchId,expiresAt:s.lastCompleted.expiresAt,hand:Holdem.restore(s.lastCompleted.hand).view(id)}:null,
       config:s.config,seats:s.seats.map(p=>({...p,online:this.online.has(p.id)})),hand:s.hand?Holdem.restore(s.hand).view(id):null,
       squid:s.squid,notices:s.notices,me:this.store.publicUser(user),
     };
