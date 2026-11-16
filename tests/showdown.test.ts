@@ -82,7 +82,8 @@ test('history only stores public hole cards; last-hand voluntary showing works a
     f.cmd(0,'action',{action:'fold'});f.cmd(0,'endRoom');assert.equal(f.room.state.match,null);
     assert.ok(f.store.handHistory(matchId)[0].players.every(p=>p.publicCards.every(c=>c===null)));
     const raw=String((f.store.db.prepare('SELECT summary FROM hands WHERE id=?').get(id) as {summary:string}).summary);
-    assert.ok(!raw.includes('"deck"'));assert.ok(!raw.includes('"cards"'));assert.ok(!raw.includes(own[0]));
+    assert.ok(!raw.includes('"deck"'));assert.ok(!raw.includes('"cards"'));assert.ok(!raw.includes(JSON.stringify(own[0])));
+    assert.ok(!f.store.handHistory(matchId)[0].log.some(line=>line.split(/\s+/).includes(own[0])));
     f.cmd(0,'showCards',{handId:id,indices:[0]});const history=f.store.handHistory(matchId)[0];assert.deepEqual(history.players[0].publicCards,[own[0],null]);
     assert.equal(history.players.reduce((n,p)=>n+p.profit,0),0);
     assert.equal(f.room.view(f.users[1].id).lastCompleted?.hand.players[0].cards.length,1);

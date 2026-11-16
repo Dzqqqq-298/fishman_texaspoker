@@ -2,6 +2,7 @@ import { Holdem, type HandState } from '../../packages/game-engine/holdem';
 import { DEFAULT_ROOM_CONFIG, type RoomConfig, type MatchSession, type MatchResult } from '../../packages/game-engine/room-config';
 import { Store } from './store';
 import type { HandRecord, ChatMessage } from '../../packages/game-engine/records';
+import {planSeats,crossedSeat,type BlindAccount} from '../../packages/game-engine/seating';
 
 interface Seat {id:number;name:string;seat:number;stack:number;straddle:boolean;sittingOut:boolean;timeouts:number}
 interface Squid {unit:number;participants:number[];marked:number[];reserve:number}
@@ -11,6 +12,7 @@ interface State {
   config:RoomConfig; match:MatchSession|null; squid:Squid|null; notices:string[];
   chat:ChatMessage[];lastCompleted:{hand:HandState;matchId:string;number:number;completedAt:number;expiresAt:number}|null;
   straddlePlan:{key:string;choices:Record<number,boolean>}|null;
+  blindAccounts:Record<number,BlindAccount>;previousBlinds:{small:number;big:number}|null;
 }
 export function gameDay(now=Date.now()) {return new Date(now+4*3600000).toISOString().slice(0,10);}
 const playing=(s:State)=>!!s.hand&&s.hand.street!=='finished';
@@ -23,12 +25,15 @@ export class Room {
     this.state=store.load<State>()??{
       version:0,day:gameDay(),hostId:null,seats:[],hand:null,running:false,pausedForRecovery:false,
       button:-1,deadline:0,nextDeal:0,timeArmed:null,timeExtended:false,
-      config:{...DEFAULT_ROOM_CONFIG},match:null,squid:null,notices:['欢迎来到鱼人大厅，创建房间或加入朋友的牌局。'],chat:[],lastCompleted:null,straddlePlan:null,
+      config:{...DEFAULT_ROOM_CONFIG},match:null,squid:null,notices:['欢迎来到鱼人大厅，创建房间或加入朋友的牌局。'],chat:[],lastCompleted:null,straddlePlan:null,blindAccounts:{},previousBlinds:null,
     };
     const s=this.state;
     s.config={...DEFAULT_ROOM_CONFIG,...s.config};
     s.chat??=[];s.lastCompleted??=null;if(s.hand)Holdem.restore(s.hand);if(s.lastCompleted)Holdem.restore(s.lastCompleted.hand);
     s.straddlePlan??=null;
+    s.blindAccounts??={};s.previousBlinds??=null;
+    for(const p of s.seats)s.blindAccounts[p.id]??={small:false,big:false,mode:'ready',lastSeat:p.seat};
+    if(!s.previousBlinds&&s.hand){const ps=s.hand.players,i=ps.findIndex(p=>p.seat===s.hand!.button),small=ps.length===2?i:(i+1)%ps.length;s.previousBlinds={small:ps[small].seat,big:ps[(small+1)%ps.length].seat};}
     // Upgrade the original always-open table without discarding chips or an active hand.
     if(s.match===undefined) {
       s.match=s.seats.length||s.hand?{
@@ -100,6 +105,7 @@ export class Room {
       s.match={id:crypto.randomUUID(),name:data.name.trim(),createdAt:Date.now(),startedAt:null,endsAt:null,endRequested:false,endReason:null,handCount:0,players:[]};
       s.hostId=id;s.button=-1;s.seats=[];s.hand=null;s.running=false;s.pausedForRecovery=false;
       s.deadline=0;s.timeArmed=null;s.timeExtended=false;s.squid=null;s.chat=[];
+      s.blindAccounts={};s.previousBlinds=null;
       s.notices=[`${this.store.user(id)!.name} 创建了房间「${s.match.name}」，等待入座。`];
       return;
     }
@@ -129,6 +135,10 @@ export class Room {
       if(amount<s.config.minBuyIn||amount>s.config.maxBuyIn)throw new Error(`带入范围为 ${s.config.minBuyIn}～${s.config.maxBuyIn}`);
       this.store.balance(id,-amount,'带入');this.addBuyIn(id,amount);
       const user=this.store.user(id)!;
+      const account=s.blindAccounts[id]??{small:false,big:!!s.match.startedAt,mode:s.match.startedAt?'wait':'ready',lastSeat:seat};
+      account.lastSeat=seat;
+      if(account.big||account.small)account.mode=this.entryMode(data.entryMode);
+      s.blindAccounts[id]=account;
       s.seats.push({id,name:user.name,seat,stack:amount,straddle:false,sittingOut:false,timeouts:0});
       this.note(`${user.name} 带入 ${amount}，加入牌桌`);
     } else if(type==='topup') {
@@ -138,10 +148,22 @@ export class Room {
       this.store.balance(id,-amount,'追加带入');this.addBuyIn(id,amount);seat.stack+=amount;
     } else if(type==='leave') {
       this.between();const seat=this.seat(id);if(s.squid)this.finishSquid();
+      if(s.match.startedAt){const account=s.blindAccounts[id];account.big=true;account.mode='wait';account.lastSeat=seat.seat;}
       this.store.balance(id,seat.stack,'离桌退回');s.match.players.find(p=>p.id===id)!.cashOut+=seat.stack;
       s.seats=s.seats.filter(p=>p.id!==id);
       // The creator remains host even when standing up or browsing the lobby.
       if(s.seats.length<2)s.running=false;
+    } else if(type==='moveSeat') {
+      this.between();const seat=this.seat(id),target=data.seat;
+      if(typeof target!=='number'||!Number.isInteger(target)||target<0||target>=s.config.maxPlayers)throw new Error('座位编号无效');
+      if(s.seats.some(p=>p.seat===target))throw new Error('该座位已有人，请选择其他空座');
+      const old=seat.seat;seat.seat=target;const account=s.blindAccounts[id];account.lastSeat=target;
+      if(s.match.startedAt){account.big=true;account.mode=this.entryMode(data.entryMode);}
+      s.straddlePlan=null;this.note(`${seat.name} 从 ${old+1} 号换至 ${target+1} 号座位`);
+    } else if(type==='entry') {
+      const seat=this.seat(id),account=s.blindAccounts[id];
+      if(account.mode==='ready'&&!account.small&&!account.big)throw new Error('当前无需补盲');
+      account.mode=this.entryMode(data.entryMode);seat.sittingOut=false;seat.timeouts=0;
     } else if(type==='straddle') {
       const plan=this.nextStraddlePlan(),index=plan?.chain.findIndex(p=>p.id===id)??-1;
       const offer=plan?.chain[index];
@@ -151,7 +173,7 @@ export class Room {
       // Changing a link also cancels every later link; no consent carries to another amount.
       s.straddlePlan={key:plan.key,choices:Object.fromEntries([...plan.chain.slice(0,index).map(p=>[p.id,true]),[id,data.enabled]])};
     } else if(type==='away') {
-      const seat=this.seat(id);seat.sittingOut=Boolean(data.enabled);if(!seat.sittingOut)seat.timeouts=0;
+      const seat=this.seat(id);seat.sittingOut=Boolean(data.enabled);if(!seat.sittingOut){seat.timeouts=0;const account=s.blindAccounts[id];if(account.big||account.small)account.mode=this.entryMode(data.entryMode);}
     } else if(type==='start') {
       this.host(id);
       if(s.pausedForRecovery&&playing(s)) {
@@ -188,15 +210,21 @@ export class Room {
     } else throw new Error('未知操作');
   }
 
-  private nextEntries() {
-    // During a hand, seat.stack is its starting stack: the final balance is not known yet.
-    return this.state.seats.filter(p=>!p.sittingOut&&p.stack>0&&this.online.has(p.id)).sort((a,b)=>a.seat-b.seat);
+  private entryMode(value:unknown):'wait'|'post' {
+    if(value===undefined)return 'wait';
+    if(value!=='wait'&&value!=='post')throw new Error('请选择等大盲或补盲入局');return value;
+  }
+  private nextDealPlan() {
+    const s=this.state;
+    const plan=planSeats(s.seats.map(p=>({...p,online:this.online.has(p.id),blind:s.blindAccounts[p.id]})),s.button,s.config.bigBlind,s.config.smallBlind);
+    if(!plan)return null;
+    return {...plan,entries:plan.entries.map(p=>({...p,...(p.blind.mode==='post'&&p.id!==plan.big.id?{postBlind:{live:p.blind.big?s.config.bigBlind:0,dead:p.blind.small?s.config.smallBlind:0}}:{})}))};
   }
   private nextStraddlePlan() {
-    const s=this.state,entries=this.nextEntries();
-    if(!s.match||s.match.endRequested||!s.config.straddleMax||entries.length<3)return null;
-    const button=(entries.find(p=>p.seat>s.button)??entries[0]).seat;
-    const key=JSON.stringify([s.match.id,s.hand?.id??null,button,entries.map(p=>p.id),s.config.bigBlind,s.config.straddleMax]);
+    const s=this.state,deal=this.nextDealPlan();
+    if(!s.match||s.match.endRequested||!s.config.straddleMax||!deal||deal.entries.length<3)return null;
+    const {entries,button}=deal;
+    const key=JSON.stringify([s.match.id,s.hand?.id??null,button,s.seats.map(p=>[p.id,p.seat,p.sittingOut,this.online.has(p.id),s.blindAccounts[p.id]]),s.config.bigBlind,s.config.straddleMax]);
     const choices=s.straddlePlan?.key===key?s.straddlePlan.choices:{};
     const buttonIndex=entries.findIndex(p=>p.seat===button);
     const chain:{id:number;amount:number;multiple:number;status:'offer'|'accepted'|'declined'|'insufficient'}[]=[];
@@ -204,10 +232,30 @@ export class Room {
       const multiple=2**(i+1),amount=multiple*s.config.bigBlind;
       if(multiple>s.config.straddleMax)break;
       const p=entries[(buttonIndex+3+i)%entries.length];
-      const status=p.stack<amount?'insufficient':choices[p.id]===true?'accepted':choices[p.id]===false?'declined':'offer';
+      const status=p.stack-(p.postBlind?.dead??0)<amount?'insufficient':choices[p.id]===true?'accepted':choices[p.id]===false?'declined':'offer';
       chain.push({id:p.id,amount,multiple,status});if(status!=='accepted')break;
     }
     return {key,button,chain};
+  }
+  private recordMissedBlinds(deal:NonNullable<ReturnType<Room['nextDealPlan']>>) {
+    const s=this.state,previous=s.previousBlinds;
+    const full=[...s.seats].sort((a,b)=>a.seat-b.seat);
+    const firstButton=full.findIndex(p=>p.seat===deal.button);
+    const prior=s.hand?.players??[];
+    const nominalButton=prior.findIndex(p=>p.seat>s.button);
+    const nominalSmall=prior.length===2?(nominalButton<0?0:nominalButton):((nominalButton<0?0:nominalButton)+1)%prior.length;
+    const nominalBig=(nominalSmall+1)%prior.length;
+    for(const [id,account] of Object.entries(s.blindAccounts)) {
+      if(deal.entries.some(p=>p.id===Number(id)))continue;
+      const seat=s.seats.find(p=>p.id===Number(id));
+      if(account.mode==='wait'&&(!s.match!.players.find(p=>p.id===Number(id))?.hands||seat&&!seat.sittingOut&&this.online.has(seat.id)))continue;
+      const small=previous?(previous.small===deal.small.seat?prior[nominalSmall]?.id===Number(id):crossedSeat(previous.small,deal.small.seat,account.lastSeat)):full[(firstButton+(full.length===2?0:1))%full.length]?.id===Number(id);
+      const big=previous?(previous.big===deal.big.seat?prior[nominalBig]?.id===Number(id):crossedSeat(previous.big,deal.big.seat,account.lastSeat)):full[(firstButton+(full.length===2?1:2))%full.length]?.id===Number(id);
+      account.small||=small;account.big||=big;
+      if((small||big)&&account.mode==='ready')account.mode='wait';
+    }
+    s.previousBlinds={small:deal.small.seat,big:deal.big.seat};
+    for(const p of deal.entries)s.blindAccounts[p.id]={small:false,big:false,mode:'ready',lastSeat:p.seat};
   }
   private syncStraddlePlan() {
     const plan=this.nextStraddlePlan(),s=this.state;
@@ -226,15 +274,16 @@ export class Room {
     if(!m||m.endRequested)throw new Error('房间已结束或正在收尾');
     if(m.endsAt!==null&&Date.now()>=m.endsAt)throw new Error('比赛时间已到，等待结算');
     const plan=this.nextStraddlePlan();
-    const entries=this.nextEntries().map(p=>({...p,straddle:!!plan?.chain.some(c=>c.id===p.id&&c.status==='accepted')}));
-    if(entries.length<2)throw new Error('至少需要两名在线且有筹码的玩家');
+    const deal=this.nextDealPlan();
+    if(!deal)throw new Error('至少需要两名可入局玩家；等大盲无法开局时，可选择补盲入局');
+    const entries=deal.entries.map(({blind,online,...p})=>({...p,straddle:!!plan?.chain.some(c=>c.id===p.id&&c.status==='accepted')}));
     if(s.squid&&s.squid.participants.some(id=>!entries.some(p=>p.id===id)))throw new Error('鱿鱼参与者未就绪：请等待，或由房主提前结算本轮');
     if(s.config.squidEnabled&&!s.squid&&entries.length>=3) {
       const reserve=(entries.length-1)*s.config.squidUnit;
       entries.forEach(p=>this.store.balance(p.id,-reserve,'鱿鱼预留'));
       s.squid={unit:s.config.squidUnit,participants:entries.map(p=>p.id),marked:[],reserve};
     }
-    s.button=(entries.find(p=>p.seat>s.button)??entries[0]).seat;
+    this.recordMissedBlinds(deal);s.button=deal.button;
     s.straddlePlan=null;
     s.lastCompleted=null;
     s.hand=new Holdem(entries,s.button,s.config.smallBlind,s.config.bigBlind,s.config.straddleMax,crypto.randomUUID(),s.config.maxRunouts,s.config.showdownMode).state;
@@ -269,10 +318,10 @@ export class Room {
   private saveHandRecord(last:NonNullable<State['lastCompleted']>) {
     const h=Holdem.restore(last.hand).view(0);
     const summary:HandRecord={id:h.id,matchId:last.matchId,number:last.number,completedAt:last.completedAt,board:h.board,boards:h.boards.length?h.boards:[h.board],pots:h.pots,log:h.log,
-      players:h.players.map(p=>({id:p.id,name:p.name,seat:p.seat,publicCards:p.publicCards,stack:p.stack,contributed:p.total,profit:h.pots.filter(pot=>pot.winners.includes(p.id)).reduce((n,pot)=>{
+      players:h.players.map(p=>({id:p.id,name:p.name,seat:p.seat,publicCards:p.publicCards,stack:p.stack,contributed:p.total+p.deadBlind,profit:h.pots.filter(pot=>pot.winners.includes(p.id)).reduce((n,pot)=>{
         const winners=pot.winners.map(id=>h.players.find(p=>p.id===id)!).sort((a,b)=>((a.seat-h.button+11)%11||11)-((b.seat-h.button+11)%11||11));
         return n+Math.floor(pot.amount/winners.length)+(winners.findIndex(w=>w.id===p.id)<pot.amount%winners.length?1:0);
-      },0)-p.total,folded:p.folded}))};
+      },0)-p.total-p.deadBlind,folded:p.folded}))};
     this.store.saveHand(summary);
   }
   private finishSquid() {
@@ -304,6 +353,7 @@ export class Room {
     this.store.saveMatch(result);
     s.match=null;s.seats=[];s.hand=null;s.hostId=null;s.running=false;s.pausedForRecovery=false;
     s.deadline=0;s.timeArmed=null;s.timeExtended=false;s.button=-1;
+    s.blindAccounts={};s.previousBlinds=null;
     this.note(`「${m.name}」已结束，积分已退回账户，战绩已保存。`);
   }
 
@@ -344,6 +394,7 @@ export class Room {
   }
   view(id:number) {
     const s=this.state,user=this.store.user(id)!;
+    const deal=this.nextDealPlan();
     const phase: 'empty'|'waiting'|'running'|'paused'|'ending'=!s.match?'empty':s.match.endRequested?'ending':!s.match.startedAt?'waiting':s.running||playing(s)&&!s.pausedForRecovery?'running':'paused';
     return {
       version:s.version,day:s.day,hostId:s.hostId,hostName:s.hostId?this.store.user(s.hostId)?.name??null:null,running:s.running,pausedForRecovery:s.pausedForRecovery,
@@ -351,8 +402,10 @@ export class Room {
       phase,match:s.match,recentMatches:this.store.recentMatches(),
       chat:s.chat,chatBlocked:playing(s)&&!!s.hand?.players.find(p=>p.id===id)?.allIn,
       nextStraddle:this.nextStraddlePlan(),
+      nextDeal:deal?{button:deal.button,small:deal.small.id,big:deal.big.id,players:deal.entries.map(p=>p.id)}:null,
+      entry:s.blindAccounts[id]??null,
       lastCompleted:s.lastCompleted?{matchId:s.lastCompleted.matchId,expiresAt:s.lastCompleted.expiresAt,hand:Holdem.restore(s.lastCompleted.hand).view(id)}:null,
-      config:s.config,seats:s.seats.map(p=>({...p,online:this.online.has(p.id)})),hand:s.hand?Holdem.restore(s.hand).view(id):null,
+      config:s.config,seats:s.seats.map(p=>({...p,online:this.online.has(p.id),entryMode:s.blindAccounts[p.id].mode,blindDebt:{small:s.blindAccounts[p.id].small?s.config.smallBlind:0,big:s.blindAccounts[p.id].big?s.config.bigBlind:0}})),hand:s.hand?Holdem.restore(s.hand).view(id):null,
       squid:s.squid,notices:s.notices,me:this.store.publicUser(user),
     };
   }

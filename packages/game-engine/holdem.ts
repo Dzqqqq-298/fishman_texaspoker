@@ -1,7 +1,7 @@
 import { deck, evaluate, compare, type Card } from './cards';
 
-export interface Entrant { id: number; name: string; seat: number; stack: number; straddle?: boolean }
-export interface Player extends Entrant { cards: Card[]; bet: number; total: number; folded: boolean; actedAt: number | null; action: string; allIn:boolean }
+export interface Entrant { id: number; name: string; seat: number; stack: number; straddle?: boolean;postBlind?:{live:number;dead:number} }
+export interface Player extends Entrant { cards: Card[]; bet: number; total: number; deadBlind:number; folded: boolean; actedAt: number | null; action: string; allIn:boolean }
 export interface PotResult { amount: number; winners: number[]; returned?: boolean; board?:number; potIndex?:number }
 export interface HandState {
   id: string; players: Player[]; board: Card[]; deck: Card[]; button: number; smallBlind: number; bigBlind: number;
@@ -14,19 +14,29 @@ export class Holdem {
   state: HandState;
   constructor(entries: Entrant[], buttonSeat: number, sb=10, bb=20, straddleMax=8, id=crypto.randomUUID(),maxRunouts:1|2=1,showdownMode:'auto'|'all'='auto') {
     if(entries.length < 2 || entries.length > 11) throw new Error('需要 2～11 名玩家');
-    const players = [...entries].sort((a,b)=>a.seat-b.seat).map(p=>({...p,cards:[] as Card[],bet:0,total:0,folded:false,actedAt:null,action:'',allIn:false}));
+    const players = [...entries].sort((a,b)=>a.seat-b.seat).map(p=>({...p,cards:[] as Card[],bet:0,total:0,deadBlind:0,folded:false,actedAt:null,action:'',allIn:false}));
     this.state = {id,players,board:[],deck:deck(),button:buttonSeat,smallBlind:sb,bigBlind:bb,street:'preflop',currentBet:bb,minRaise:bb,pending:[],actor:null,pots:[],log:[],straddles:[],boards:[],shown:{},lastAggressor:null,maxRunouts,showdownMode,runout:null};
     const button = players.findIndex(p=>p.seat===buttonSeat);
     if(button < 0) throw new Error('庄位无效');
     const small = players.length===2 ? button : (button+1)%players.length;
     const big = (small+1)%players.length;
+    for(const p of players)if(p.postBlind){
+      const {live,dead}=p.postBlind;
+      if(!Number.isSafeInteger(live)||!Number.isSafeInteger(dead)||live<0||dead<0||live>bb||dead>sb||p.stack<live+dead||p.stack<=dead)throw new Error('补盲筹码不足或金额无效');
+      p.stack-=dead;p.deadBlind=dead;
+      if(dead)this.state.log.push(`${p.name} · 补小盲 ${dead}（不抵跟注）`);
+    }
     this.pay(players[small], Math.min(sb,players[small].stack)); players[small].action='小盲';
     this.pay(players[big], Math.min(bb,players[big].stack)); players[big].action='大盲';
+    for(const p of players)if(p.postBlind?.live){
+      const amount=Math.max(0,p.postBlind.live-p.bet);this.pay(p,Math.min(amount,p.stack));
+      this.state.log.push(`${p.name} · 补大盲 ${p.postBlind.live}（计入本轮下注）`);
+    }
     let last = big, amount=bb*2;
     if(players.length>2) for(let k=1;k<=players.length-2 && amount<=bb*straddleMax;k++) {
       const index=(big+k)%players.length, p=players[index];
-      if(!p.straddle || p.stack<amount) break;
-      this.pay(p,amount); p.action=`Straddle ${amount}`; last=index;
+      if(!p.straddle || p.stack+p.bet<amount) break;
+      this.pay(p,amount-p.bet); p.action=`Straddle ${amount}`; last=index;
       this.state.straddles.push({id:p.id,amount}); this.state.currentBet=amount; this.state.minRaise=amount; amount*=2;
     }
     for(let round=0;round<2;round++) for(let k=1;k<=players.length;k++) players[(button+k)%players.length].cards.push(this.state.deck.pop()!);
@@ -38,7 +48,7 @@ export class Holdem {
     const h=Object.create(Holdem.prototype) as Holdem;h.state=state;
     state.boards??=[];state.maxRunouts??=1;state.showdownMode??='auto';state.runout??=null;state.lastAggressor??=null;
     state.shown??=Object.fromEntries(state.street==='finished'&&state.players.filter(p=>!p.folded).length>1?state.players.filter(p=>!p.folded).map(p=>[p.id,[0,1]]):[]);
-    state.players.forEach(p=>p.allIn??=p.stack===0);return h;
+    state.players.forEach(p=>{p.allIn??=p.stack===0;p.deadBlind??=0;});return h;
   }
   private pay(p:Player,n:number) { p.stack-=n;p.bet+=n;p.total+=n;if(p.stack===0)p.allIn=true; }
   legal(id:number) {
@@ -129,10 +139,11 @@ export class Holdem {
   }
   private settle() {
     const s=this.state,levels=[...new Set(s.players.map(p=>p.total).filter(Boolean))].sort((a,b)=>a-b);
-    const boards=s.boards.length?s.boards:[s.board];let previous=0,potIndex=0;
+    const boards=s.boards.length?s.boards:[s.board];let previous=0,potIndex=0,dead=s.players.reduce((n,p)=>n+p.deadBlind,0);
     for(const level of levels) {
-      const contributors=s.players.filter(p=>p.total>=level),amount=(level-previous)*contributors.length;previous=level;
+      const contributors=s.players.filter(p=>p.total>=level);let amount=(level-previous)*contributors.length;previous=level;
       if(contributors.length===1) {contributors[0].stack+=amount;s.pots.push({amount,winners:[contributors[0].id],returned:true});continue;}
+      amount+=dead;dead=0; // Dead small blinds enter the main pot, never enlarge a side-pot cap.
       const eligible=contributors.filter(p=>!p.folded);
       for(let run=0;run<boards.length;run++) {
         const portion=Math.floor(amount/boards.length)+(run<amount%boards.length?1:0);let winners=eligible;
@@ -168,7 +179,7 @@ export class Holdem {
   view(id:number) {
     const s=this.state;
     return {id:s.id,button:s.button,street:s.street,board:s.board,boards:s.boards,currentBet:s.currentBet,actor:s.actor,straddles:s.straddles,runout:s.runout,
-      pot:s.players.reduce((n,p)=>n+p.total,0),pots:s.pots,log:s.log,legal:this.legal(id),
+      pot:s.players.reduce((n,p)=>n+p.total+p.deadBlind,0),pots:s.pots,log:s.log,legal:this.legal(id),
       players:s.players.map(({cards,actedAt,...p})=>{
         const shown=s.shown[p.id]??[],publicCards=cards.map((c,i)=>shown.includes(i)?c:null);
         return {...p,shown,publicCards,cards:p.id===id?cards:publicCards.filter((c):c is Card=>c!==null),handName:s.street==='finished'&&s.board.length===5&&!p.folded&&(p.id===id||shown.length===2)?evaluate([...cards,...s.board]).name:null};

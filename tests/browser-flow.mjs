@@ -134,10 +134,26 @@ try {
   await foldCurrentHand();await host.getByRole('button',{name:'继续比赛',exact:true}).click();
   await until(async()=>(await state(host)).hand.id!==initialHand);
   assert.deepEqual((await state(host)).hand.straddles.map(s=>s.amount),[40,80]);
+  await host.getByRole('button',{name:'设置',exact:true}).click();await host.getByRole('button',{name:'本手后暂停',exact:true}).click();await host.keyboard.press('Escape');
+  await foldCurrentHand();
+  for(const page of [extras[1],friend]){await page.getByRole('button',{name:'设置',exact:true}).click();await page.getByRole('button',{name:'离桌',exact:true}).click();await page.getByRole('dialog').waitFor({state:'detached'});}
+  await friend.getByRole('button',{name:'2 号空座，点击入座',exact:true}).click();
+  await friend.getByRole('button',{name:'确认入座',exact:true}).click();await friend.getByRole('dialog').waitFor({state:'detached'});
+  await friend.getByText('等待大盲入局',{exact:true}).waitFor();
+  await friend.getByRole('button',{name:'补盲入局 · 20',exact:true}).click();await friend.getByText('已选补盲入局',{exact:true}).waitFor();
+  await friend.getByRole('button',{name:'改为等大盲',exact:true}).click();
+  const beforeMove=await state(friend),friendId=beforeMove.me.id,stackBefore=beforeMove.seats.find(s=>s.id===friendId).stack;
+  await friend.getByRole('button',{name:'4 号空座，点击换座',exact:true}).click();
+  await friend.getByRole('dialog').getByRole('button',{name:'补盲入局 · 20',exact:true}).click();
+  await friend.getByRole('button',{name:'确认换座',exact:true}).click();await friend.getByRole('dialog').waitFor({state:'detached'});
+  const moved=await state(friend);assert.equal(moved.seats.find(s=>s.id===friendId).seat,3);assert.equal(moved.seats.find(s=>s.id===friendId).stack,stackBefore);assert.equal(moved.me.balance,beforeMove.me.balance);
+  await host.getByRole('button',{name:'继续比赛',exact:true}).click();
+  await until(async()=>(await state(host)).hand.id!==moved.hand.id);
+  const admitted=(await state(friend)).hand.players.find(p=>p.id===friendId);assert.equal(admitted.seat,3);assert.equal(admitted.bet,20);
   await host.getByRole('button',{name:'设置',exact:true}).click();await host.getByRole('button',{name:'结束比赛',exact:true}).click();await host.getByRole('dialog').waitFor({state:'detached'});
   await foldCurrentHand();await host.getByRole('heading',{name:'本场结算',exact:true}).waitFor();
   assert.deepEqual(errors,[]);
-  console.log('UI flow passed: desktop + mobile, seat contention, buy-in, drawer focus/Escape, records, voluntary show, chat mute, raise panel, double runout, settlement and four-client next-hand Straddle relay.');
+  console.log('UI flow passed: desktop + mobile, seats, drawers, history, show, chat, betting, runouts, settlement, Straddle relay, wait/post blinds and moving seats without changing chips.');
 } finally {
   await browser?.close();child.kill();await until(()=>child.exitCode!==null||child.signalCode!==null).catch(()=>{});
   const rel=relative(resolve(tmpdir()),resolve(folder));

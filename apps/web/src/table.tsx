@@ -9,6 +9,7 @@ import { HandHistory } from './hand-history';
 import { ShowCards } from './show-cards';
 import { useGameFeedback } from './game-feedback';
 import { StraddlePrompt } from './straddle-prompt';
+import { EntryChoice,EntryControls } from './entry-controls';
 import './table.css';
 import './game-extras.css';
 
@@ -20,7 +21,8 @@ function ToolIcon({kind}:{kind:'settings'|'history'|'chat'}) {
 }
 
 export function PokerTable({room,now,disabled,error,command,clearError,onEdit}:Props) {
-  const [panel,setPanel]=useState<'settings'|'history'|'buyin'|'chat'|null>(null);
+  const [panel,setPanel]=useState<'settings'|'history'|'buyin'|'chat'|'move'|null>(null);
+  const [entryMode,setEntryMode]=useState<'wait'|'post'>('wait');
   const [selectedSeat,setSelectedSeat]=useState<number|null>(null);
   const [amount,setAmount]=useState(String(room.config.defaultBuyIn));
   const [message,setMessage]=useState('');
@@ -49,7 +51,8 @@ export function PokerTable({room,now,disabled,error,command,clearError,onEdit}:P
     return()=>controller.abort();
   },[panel,me.balance,hand?.street]);
   function open(next:'settings'|'history'|'chat') {clearError();setPanel(next);}
-  function openBuyIn(index:number|null) {clearError();setSelectedSeat(index);setAmount(String(Math.min(config.defaultBuyIn,buyInMax)));setPanel('buyin');}
+  function openBuyIn(index:number|null) {clearError();setSelectedSeat(index);setEntryMode('wait');setAmount(String(Math.min(config.defaultBuyIn,buyInMax)));setPanel('buyin');}
+  function openSeat(index:number) {if(!seat){openBuyIn(index);return;}clearError();setSelectedSeat(index);setEntryMode('wait');setPanel('move');}
   async function endRoom() {
     if(window.confirm(playing?'结束比赛？打完本手后结算。':'关闭房间并退回筹码？')&&await command('endRoom'))setPanel(null);
   }
@@ -65,19 +68,19 @@ export function PokerTable({room,now,disabled,error,command,clearError,onEdit}:P
       <div className="poker-felt" aria-hidden="true"><div/><span>鱼人德州</span></div>
       <div className="table-center">
         {hand?<><div className="pot-total"><span>{playing?'底池':'本手底池'}</span><strong>{num(hand.pot)}</strong></div><div className="board-runs">{(hand.boards.length?hand.boards:[hand.board]).map((board,run)=><div key={run}>{hand.boards.length>1&&<small>第 {run+1} 次</small>}<div className="community-cards" aria-label={`第 ${run+1} 次公共牌`}>{Array.from({length:5},(_,i)=><Card key={i} value={board[i]} empty/>)}</div></div>)}</div>
-          {playing?<span className="street-name">{{preflop:'翻牌前',flop:'翻牌',turn:'转牌',river:'河牌',runout:'协商发牌',finished:''}[hand.street]}</span>:<div className="pot-results">{hand.pots.filter(p=>!p.returned).map((p,i)=><span key={i}>{p.board!==undefined?`${p.board+1} · `:''}{p.winners.map(id=>hand.players.find(x=>x.id===id)?.name).join(' / ')} <b>+{num(p.amount)}</b></span>)}</div>}</>:<div className="table-idle"><span>盲注 {config.smallBlind}/{config.bigBlind}</span>{host?<button className="primary" disabled={disabled||room.seats.filter(p=>p.online&&!p.sittingOut&&p.stack>0).length<2} onClick={()=>command('start')}>开始比赛</button>:<span>待开赛</span>}</div>}
+          {playing?<span className="street-name">{{preflop:'翻牌前',flop:'翻牌',turn:'转牌',river:'河牌',runout:'协商发牌',finished:''}[hand.street]}</span>:<div className="pot-results">{hand.pots.filter(p=>!p.returned).map((p,i)=><span key={i}>{p.board!==undefined?`${p.board+1} · `:''}{p.winners.map(id=>hand.players.find(x=>x.id===id)?.name).join(' / ')} <b>+{num(p.amount)}</b></span>)}</div>}</>:<div className="table-idle"><span>盲注 {config.smallBlind}/{config.bigBlind}</span>{host?<button className="primary" disabled={disabled||!room.nextDeal} onClick={()=>command('start')}>开始比赛</button>:<span>待开赛</span>}</div>}
         {room.pausedForRecovery&&<span className="stage-notice">等待房主恢复</span>}
       </div>
       {Array.from({length:capacity},(_,index)=>{
         const p=room.seats.find(p=>p.seat===index),position=seatPosition(index,capacity,seat?.seat??null);
         const style={'--seat-x':`${position.left}%`,'--seat-y':`${position.top}%`,'--seat-mobile-x':`${position.mobileLeft}%`,'--seat-mobile-y':`${position.mobileTop}%`} as CSSProperties;
-        if(!p)return <button key={index} style={style} className="table-seat empty-seat" aria-label={`${index+1} 号空座，点击入座`} disabled={disabled||!!seat||match.endRequested||index>=config.maxPlayers} onClick={()=>openBuyIn(index)}><span className="seat-plus" aria-hidden="true">＋</span><span>空座</span><small>{index+1}</small></button>;
+        if(!p)return <button key={index} style={style} className="table-seat empty-seat" aria-label={`${index+1} 号空座，点击${seat?'换座':'入座'}`} disabled={disabled||!!seat&&playing||match.endRequested||index>=config.maxPlayers} onClick={()=>openSeat(index)}><span className="seat-plus" aria-hidden="true">＋</span><span>空座</span><small>{index+1}</small></button>;
         const hp=hand?.players.find(x=>x.id===p.id),active=playing&&hand?.actor===p.id,mine=p.id===me.id;
         return <div key={index} style={style} className={`table-seat player-seat ${active&&remaining<=5?'urgent':''} ${mine?'self-seat':''} ${active?'acting':''} ${playing&&hp?.folded?'has-folded':''}`} aria-label={`${index+1} 号座位 ${p.name}`}>
           {active&&<span className="seat-timer">{room.pausedForRecovery?'暂停':`${remaining}s`}</span>}
           <div className="player-avatar" style={{'--turn-progress':`${Math.min(1,remaining/(room.timeExtended?30:25))*360}deg`} as CSSProperties}>{p.name.slice(0,1)}{hp&&hand?.button===p.seat&&<span className="dealer-chip">D</span>}{room.squid?.marked.includes(p.id)&&<span className="squid-token" aria-label="鱿鱼标记">◆</span>}</div>
           <span className="player-name" title={p.name}>{p.name}</span><b className="player-stack">{num(playing&&hp?hp.stack:p.stack)}</b>
-          <span className="player-action">{!p.online?'离线':p.sittingOut?'暂离':hp?.action??''}</span>
+          <span className="player-action">{!p.online?'离线':p.sittingOut?'暂离':p.entryMode==='wait'?'等大盲':p.entryMode==='post'?'待补盲':hp?.action??''}</span>
           {playing&&hp&&hp.bet>0&&<span key={`${hand?.id}:${hand?.street}:${hp.bet}`} className={`seat-bet ${position.left>50?'bet-left':''}`}><i aria-hidden="true"/>{num(hp.bet)}</span>}
           {!mine&&!!hp?.cards.length&&<div className={`seat-cards ${position.left>50?'cards-left':''}`}>{hp.cards.map(c=><Card key={c} value={c}/>)}</div>}
         </div>;
@@ -91,18 +94,27 @@ export function PokerTable({room,now,disabled,error,command,clearError,onEdit}:P
       {hand?.street==='runout'&&<div className="runout-choice"><b>发牌次数 · {remaining}s</b>{hand.runout?.eligible.includes(me.id)?hand.runout.votes[me.id]?<span>已选择，等待对方</span>:<div><button disabled={disabled||room.pausedForRecovery} onClick={()=>command('runoutVote',{handId:hand.id,count:1})}>发一次</button><button className="primary" disabled={disabled||room.pausedForRecovery} onClick={()=>command('runoutVote',{handId:hand.id,count:2})}>同意发两次</button></div>:<span>等待双方选择</span>}</div>}
       {legal&&!room.pausedForRecovery?<BetControls room={room} disabled={disabled} command={command}/>:<div className="dock-idle">{host&&(room.pausedForRecovery||hand&&!playing&&!room.running)&&<button className="primary" disabled={disabled||(match.endRequested&&!room.pausedForRecovery)} onClick={()=>command('start')}>{room.pausedForRecovery?'恢复牌局':'继续比赛'}</button>}{seat&&<button className="quiet" disabled={disabled||playing||!config.allowTopup||match.endRequested} onClick={()=>openBuyIn(null)}>补充筹码</button>}{!seat&&<span>点击空座入座</span>}</div>}
       <StraddlePrompt room={room} disabled={disabled} command={command}/>
+      <EntryControls room={room} disabled={disabled} command={command}/>
     </footer>
 
     {panel==='buyin'&&<Overlay title={seat?'补充筹码':`${(selectedSeat??0)+1} 号座位`} kind="sheet" onClose={()=>setPanel(null)}>
-      <form className="buyin-form" onSubmit={async e=>{e.preventDefault();if(!buyInReason&&await command(seat?'topup':'sit',{amount:Number(amount),...(!seat?{seat:selectedSeat}:{})}))setPanel(null);}}>
+      <form className="buyin-form" onSubmit={async e=>{e.preventDefault();if(!buyInReason&&await command(seat?'topup':'sit',{amount:Number(amount),...(!seat?{seat:selectedSeat,entryMode}:{})}))setPanel(null);}}>
         <div className="buyin-balance"><span>可用积分</span><b>{num(me.balance)}</b></div>
         <label>带入金额<input autoFocus type="number" inputMode="numeric" required min={buyInMin} max={buyInMax} value={amount} onChange={e=>setAmount(e.target.value)}/></label>
         <div className="presets">{[...new Set([config.defaultBuyIn,config.defaultBuyIn*2,buyInMax])].filter(n=>n>=buyInMin&&n<=buyInMax).map(n=><button type="button" key={n} onClick={()=>setAmount(String(n))}>{num(n)}</button>)}</div>
         <small className="muted">{num(buyInMin)}～{num(Math.max(buyInMin,buyInMax))}</small>
+        {!seat&&match.startedAt!==null&&<EntryChoice value={entryMode} onChange={setEntryMode} big={config.bigBlind} small={room.entry?.small?config.smallBlind:0}/>}
         {buyInReason&&<p className="field-help" role="status">{buyInReason}</p>}{error&&<p className="error" role="alert">{error}</p>}
         <button className="primary wide" disabled={disabled||!!buyInReason}>{disabled?'处理中…':seat?'确认带入':'确认入座'}</button>
       </form>
     </Overlay>}
+
+    {panel==='move'&&seat&&<Overlay title={`换至 ${(selectedSeat??0)+1} 号座位`} kind="sheet" onClose={()=>setPanel(null)}><form onSubmit={async e=>{e.preventDefault();if(await command('moveSeat',{seat:selectedSeat,entryMode}))setPanel(null);}}>
+      {match.startedAt!==null&&<EntryChoice value={entryMode} onChange={setEntryMode} big={config.bigBlind} small={room.entry?.small?config.smallBlind:0}/>}
+      <p className="field-help">保留筹码 {num(seat.stack)}</p>
+      {(playing||selectedTaken)&&<p className="field-help">{playing?'本手结束后可换座':'座位已有人，请另选'}</p>}{error&&<p className="error" role="alert">{error}</p>}
+      <button className="primary" disabled={disabled||playing||selectedTaken||match.endRequested}>确认换座</button>
+    </form></Overlay>}
 
     {panel==='settings'&&<Overlay title="设置" onClose={()=>setPanel(null)}>
       <section className="drawer-section"><label className="switch"><input type="checkbox" checked={sound} onChange={e=>setSound(e.target.checked)}/>行动提示音</label></section>
