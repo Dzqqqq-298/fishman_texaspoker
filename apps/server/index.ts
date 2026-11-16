@@ -66,7 +66,7 @@ app.use('/api',(_req,res)=>res.status(404).json({error:'接口不存在'}));
 function broadcast() {for(const [id,socket] of connections)socket.emit('state',room.view(id));}
 io.use((socket,next)=>{const user=store.session(cookie(socket.request.headers.cookie));if(!user)return next(new Error('登录已失效'));socket.data.userId=user.id;next();});
 io.on('connection',socket=>{
-  const id=socket.data.userId as number;connections.get(id)?.disconnect(true);connections.set(id,socket);room.online.add(id);broadcast();
+  const id=socket.data.userId as number;connections.get(id)?.disconnect(true);connections.set(id,socket);room.online.add(id);room.refreshStraddlePlan();broadcast();
   socket.on('command',(raw:unknown,ack:unknown)=>{
     if(typeof ack!=='function')return;
     if(!store.session(cookie(socket.request.headers.cookie))){ack({ok:false,error:'登录已失效'});socket.disconnect(true);return;}
@@ -76,7 +76,7 @@ io.on('connection',socket=>{
     try {const {key,version,type,data}=parsed.data;room.command(id,key,version,type,data);ack({ok:true});broadcast();}
     catch(error){ack({ok:false,error:error instanceof Error?error.message:'操作失败'});socket.emit('state',room.view(id));}
   });
-  socket.on('disconnect',()=>{if(connections.get(id)===socket){connections.delete(id);room.online.delete(id);broadcast();}});
+  socket.on('disconnect',()=>{if(connections.get(id)===socket){connections.delete(id);room.online.delete(id);room.refreshStraddlePlan();broadcast();}});
 });
 const timer=setInterval(()=>{try{if(room.tick())broadcast();}catch(error){console.error('牌局时钟错误',error);room.state.running=false;room.state.pausedForRecovery=true;broadcast();}},500);
 if(production) {

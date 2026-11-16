@@ -10,6 +10,7 @@ interface State {
   button:number; deadline:number; nextDeal:number; timeArmed:number|null; timeExtended:boolean;
   config:RoomConfig; match:MatchSession|null; squid:Squid|null; notices:string[];
   chat:ChatMessage[];lastCompleted:{hand:HandState;matchId:string;number:number;completedAt:number;expiresAt:number}|null;
+  straddlePlan:{key:string;choices:Record<number,boolean>}|null;
 }
 export function gameDay(now=Date.now()) {return new Date(now+4*3600000).toISOString().slice(0,10);}
 const playing=(s:State)=>!!s.hand&&s.hand.street!=='finished';
@@ -22,11 +23,12 @@ export class Room {
     this.state=store.load<State>()??{
       version:0,day:gameDay(),hostId:null,seats:[],hand:null,running:false,pausedForRecovery:false,
       button:-1,deadline:0,nextDeal:0,timeArmed:null,timeExtended:false,
-      config:{...DEFAULT_ROOM_CONFIG},match:null,squid:null,notices:['欢迎来到鱼人大厅，创建房间或加入朋友的牌局。'],chat:[],lastCompleted:null,
+      config:{...DEFAULT_ROOM_CONFIG},match:null,squid:null,notices:['欢迎来到鱼人大厅，创建房间或加入朋友的牌局。'],chat:[],lastCompleted:null,straddlePlan:null,
     };
     const s=this.state;
     s.config={...DEFAULT_ROOM_CONFIG,...s.config};
     s.chat??=[];s.lastCompleted??=null;if(s.hand)Holdem.restore(s.hand);if(s.lastCompleted)Holdem.restore(s.lastCompleted.hand);
+    s.straddlePlan??=null;
     // Upgrade the original always-open table without discarding chips or an active hand.
     if(s.match===undefined) {
       s.match=s.seats.length||s.hand?{
@@ -51,12 +53,12 @@ export class Room {
   private between() {if(playing(this.state))throw new Error('请在本手结束后操作');}
   private atomic(fn:()=>void,versioned=true) {
     const backup=structuredClone(this.state);
-    try {this.store.transaction(()=>{fn();if(versioned)this.state.version++;this.store.save(this.state);});}
+    try {this.store.transaction(()=>{fn();this.syncStraddlePlan();if(versioned)this.state.version++;this.store.save(this.state);});}
     catch(error) {this.state=backup;throw error;}
   }
   command(id:number,key:string,version:number,type:string,data:Record<string,unknown>={}) {
     if(this.store.seen(id,key))return;
-    if(!['chat','showCards','runoutVote'].includes(type)&&version!==this.state.version)throw new Error('牌桌已更新，请重新操作');
+    if(!['chat','showCards','runoutVote','straddle'].includes(type)&&version!==this.state.version)throw new Error('牌桌已更新，请重新操作');
     this.atomic(()=>{this.apply(id,type,data);this.store.remember(id,key);},type!=='chat');
   }
   private amount(value:unknown) {
@@ -141,7 +143,13 @@ export class Room {
       // The creator remains host even when standing up or browsing the lobby.
       if(s.seats.length<2)s.running=false;
     } else if(type==='straddle') {
-      this.seat(id).straddle=Boolean(data.enabled);
+      const plan=this.nextStraddlePlan(),index=plan?.chain.findIndex(p=>p.id===id)??-1;
+      const offer=plan?.chain[index];
+      if(!plan||plan.key!==data.planKey||!offer||offer.amount!==data.amount||typeof data.enabled!=='boolean')throw new Error('下一手抓位已变化，请重新选择');
+      if(offer.status==='insufficient')throw new Error('筹码不足，无法预约 Straddle');
+      if((offer.status==='accepted'&&data.enabled)||(offer.status==='declined'&&!data.enabled))return;
+      // Changing a link also cancels every later link; no consent carries to another amount.
+      s.straddlePlan={key:plan.key,choices:Object.fromEntries([...plan.chain.slice(0,index).map(p=>[p.id,true]),[id,data.enabled]])};
     } else if(type==='away') {
       const seat=this.seat(id);seat.sittingOut=Boolean(data.enabled);if(!seat.sittingOut)seat.timeouts=0;
     } else if(type==='start') {
@@ -180,11 +188,45 @@ export class Room {
     } else throw new Error('未知操作');
   }
 
+  private nextEntries() {
+    // During a hand, seat.stack is its starting stack: the final balance is not known yet.
+    return this.state.seats.filter(p=>!p.sittingOut&&p.stack>0&&this.online.has(p.id)).sort((a,b)=>a.seat-b.seat);
+  }
+  private nextStraddlePlan() {
+    const s=this.state,entries=this.nextEntries();
+    if(!s.match||s.match.endRequested||!s.config.straddleMax||entries.length<3)return null;
+    const button=(entries.find(p=>p.seat>s.button)??entries[0]).seat;
+    const key=JSON.stringify([s.match.id,s.hand?.id??null,button,entries.map(p=>p.id),s.config.bigBlind,s.config.straddleMax]);
+    const choices=s.straddlePlan?.key===key?s.straddlePlan.choices:{};
+    const buttonIndex=entries.findIndex(p=>p.seat===button);
+    const chain:{id:number;amount:number;multiple:number;status:'offer'|'accepted'|'declined'|'insufficient'}[]=[];
+    for(let i=0;i<entries.length-2;i++) {
+      const multiple=2**(i+1),amount=multiple*s.config.bigBlind;
+      if(multiple>s.config.straddleMax)break;
+      const p=entries[(buttonIndex+3+i)%entries.length];
+      const status=p.stack<amount?'insufficient':choices[p.id]===true?'accepted':choices[p.id]===false?'declined':'offer';
+      chain.push({id:p.id,amount,multiple,status});if(status!=='accepted')break;
+    }
+    return {key,button,chain};
+  }
+  private syncStraddlePlan() {
+    const plan=this.nextStraddlePlan(),s=this.state;
+    if(!plan){s.straddlePlan=null;return;}
+    if(s.straddlePlan?.key!==plan.key){s.straddlePlan={key:plan.key,choices:{}};return;}
+    // A player losing the required chips also invalidates their downstream reservations.
+    const valid=new Set(plan.chain.filter(p=>p.status==='accepted'||p.status==='declined').map(p=>String(p.id)));
+    for(const id of Object.keys(s.straddlePlan.choices))if(!valid.has(id))delete s.straddlePlan.choices[Number(id)];
+  }
+  refreshStraddlePlan() {
+    // Presence changes happen outside commands; persist invalidation even on a brief disconnect.
+    if((this.nextStraddlePlan()?.key??null)!==(this.state.straddlePlan?.key??null))this.atomic(()=>{});
+  }
   private beginHand() {
     const s=this.state,m=s.match;
     if(!m||m.endRequested)throw new Error('房间已结束或正在收尾');
     if(m.endsAt!==null&&Date.now()>=m.endsAt)throw new Error('比赛时间已到，等待结算');
-    const entries=s.seats.filter(p=>!p.sittingOut&&p.stack>0&&this.online.has(p.id)).sort((a,b)=>a.seat-b.seat);
+    const plan=this.nextStraddlePlan();
+    const entries=this.nextEntries().map(p=>({...p,straddle:!!plan?.chain.some(c=>c.id===p.id&&c.status==='accepted')}));
     if(entries.length<2)throw new Error('至少需要两名在线且有筹码的玩家');
     if(s.squid&&s.squid.participants.some(id=>!entries.some(p=>p.id===id)))throw new Error('鱿鱼参与者未就绪：请等待，或由房主提前结算本轮');
     if(s.config.squidEnabled&&!s.squid&&entries.length>=3) {
@@ -193,6 +235,7 @@ export class Room {
       s.squid={unit:s.config.squidUnit,participants:entries.map(p=>p.id),marked:[],reserve};
     }
     s.button=(entries.find(p=>p.seat>s.button)??entries[0]).seat;
+    s.straddlePlan=null;
     s.lastCompleted=null;
     s.hand=new Holdem(entries,s.button,s.config.smallBlind,s.config.bigBlind,s.config.straddleMax,crypto.randomUUID(),s.config.maxRunouts,s.config.showdownMode).state;
     s.deadline=Date.now()+(s.hand.street==='runout'?10000:25000);s.timeArmed=null;s.timeExtended=false;
@@ -307,6 +350,7 @@ export class Room {
       deadline:s.deadline,timeArmed:s.timeArmed,timeExtended:s.timeExtended,serverNow:Date.now(),
       phase,match:s.match,recentMatches:this.store.recentMatches(),
       chat:s.chat,chatBlocked:playing(s)&&!!s.hand?.players.find(p=>p.id===id)?.allIn,
+      nextStraddle:this.nextStraddlePlan(),
       lastCompleted:s.lastCompleted?{matchId:s.lastCompleted.matchId,expiresAt:s.lastCompleted.expiresAt,hand:Holdem.restore(s.lastCompleted.hand).view(id)}:null,
       config:s.config,seats:s.seats.map(p=>({...p,online:this.online.has(p.id)})),hand:s.hand?Holdem.restore(s.hand).view(id):null,
       squid:s.squid,notices:s.notices,me:this.store.publicUser(user),

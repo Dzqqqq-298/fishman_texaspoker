@@ -100,8 +100,44 @@ try {
   const twice=await state(host),twiceHistory=await (await host.request.get(`${base}/api/hands?matchId=${twice.recentMatches[0].id}`)).json();
   assert.equal(twiceHistory.hands[0].boards.length,2);assert.ok(twiceHistory.hands[0].players.every(p=>p.publicCards.every(Boolean)));
   assert.equal(twice.recentMatches[0].players.reduce((n,p)=>n+p.profit,0),0);
+  // Four real clients: reserve next hand's UTG straddle while this hand is still running.
+  for(const page of [host,friend])await page.getByRole('button',{name:'返回大厅',exact:true}).click();
+  const extras=[];
+  for(let i=0;i<2;i++){
+    const username=`straddlefriend${i}`;
+    const added=await host.request.post(`${base}/api/admin/users`,{headers:{Origin:base},data:{username,name:`接力玩家${i}`,password}});assert.equal(added.status(),200);
+    const context=await browser.newContext({viewport:{width:375,height:812},isMobile:true,hasTouch:true}),page=await context.newPage();
+    page.on('pageerror',e=>errors.push(e.message));page.on('dialog',d=>d.accept());page.setDefaultTimeout(10000);
+    await login(page,username);extras.push(page);
+  }
+  await host.getByRole('button',{name:'＋ 创建房间',exact:true}).click();
+  await host.getByLabel('房间名称').fill('下一手抓位测试');await host.getByLabel('人数上限').selectOption('4');
+  await host.getByRole('button',{name:'创建房间',exact:true}).click();
+  const players=[host,friend,...extras],pagesById=new Map();
+  for(let i=0;i<players.length;i++){
+    const page=players[i];if(i)await page.getByRole('button',{name:/进入房间/}).click();
+    await page.getByRole('button',{name:`${i+1} 号空座，点击入座`,exact:true}).click();await page.getByRole('button',{name:'确认入座',exact:true}).click();await page.getByRole('dialog').waitFor({state:'detached'});
+    pagesById.set((await state(page)).me.id,page);
+  }
+  await host.getByRole('button',{name:'开始比赛',exact:true}).click();
+  await host.getByRole('button',{name:'设置',exact:true}).click();await host.getByRole('button',{name:'本手后暂停',exact:true}).click();await host.keyboard.press('Escape');
+  const preview=await state(host),initialHand=preview.hand.id;
+  assert.equal(await friend.getByRole('button',{name:'Double Straddle 80',exact:true}).count(),0);
+  await host.getByRole('button',{name:'Straddle 40',exact:true}).click();
+  await friend.getByRole('button',{name:'Double Straddle 80',exact:true}).click();
+  await host.getByRole('button',{name:'取消预约',exact:true}).click();
+  await until(async()=>await friend.getByRole('button',{name:'取消预约',exact:true}).count()===0);
+  await host.getByRole('button',{name:'Straddle 40',exact:true}).click();
+  await friend.getByRole('button',{name:'Double Straddle 80',exact:true}).click();
+  assert.deepEqual((await state(host)).hand.straddles,[]);assert.equal((await state(host)).hand.id,initialHand);
+  const foldCurrentHand=async()=>{let guard=0;while(true){const s=await state(host);if(!s.match||s.hand?.street==='finished')break;assert.ok(++guard<5);const actor=pagesById.get(s.hand.actor);await actor.getByRole('button',{name:'弃牌',exact:true}).click();await until(async()=>{const after=await state(host);return !after.hand||after.hand.actor!==s.hand.actor;});}};
+  await foldCurrentHand();await host.getByRole('button',{name:'继续比赛',exact:true}).click();
+  await until(async()=>(await state(host)).hand.id!==initialHand);
+  assert.deepEqual((await state(host)).hand.straddles.map(s=>s.amount),[40,80]);
+  await host.getByRole('button',{name:'设置',exact:true}).click();await host.getByRole('button',{name:'结束比赛',exact:true}).click();await host.getByRole('dialog').waitFor({state:'detached'});
+  await foldCurrentHand();await host.getByRole('heading',{name:'本场结算',exact:true}).waitFor();
   assert.deepEqual(errors,[]);
-  console.log('UI flow passed: desktop + mobile, seat contention, buy-in, drawer focus/Escape, records, voluntary show, chat mute, raise panel, double runout and settlement.');
+  console.log('UI flow passed: desktop + mobile, seat contention, buy-in, drawer focus/Escape, records, voluntary show, chat mute, raise panel, double runout, settlement and four-client next-hand Straddle relay.');
 } finally {
   await browser?.close();child.kill();await until(()=>child.exitCode!==null||child.signalCode!==null).catch(()=>{});
   const rel=relative(resolve(tmpdir()),resolve(folder));
