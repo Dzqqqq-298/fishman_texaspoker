@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { Store, verifyPassword } from '../apps/server/store';
 import { Room, gameDay } from '../apps/server/room';
 import { Holdem } from '../packages/game-engine/holdem';
-function setup(n=3){const store=new Store(':memory:');const users=Array.from({length:n},(_,i)=>store.createUser(`user${i}`,`玩家${i}`,'test-password-123',i===0));const room=new Room(store);users.forEach(u=>room.online.add(u.id));const cmd=(id:number,type:string,data:Record<string,unknown>={})=>room.command(id,crypto.randomUUID(),room.state.version,type,data);users.forEach(u=>cmd(u.id,'sit',{amount:2000}));return {store,room,users,cmd};}
+function setup(n=3){const store=new Store(':memory:');const users=Array.from({length:n},(_,i)=>store.createUser(`user${i}`,`玩家${i}`,'test-password-123',i===0));const room=new Room(store);users.forEach(u=>room.online.add(u.id));const cmd=(id:number,type:string,data:Record<string,unknown>={})=>room.command(id,crypto.randomUUID(),room.state.version,type,data);cmd(users[0].id,'createRoom',{name:'测试好友房'});users.forEach(u=>cmd(u.id,'sit',{amount:2000}));return {store,room,users,cmd};}
 test('password hashing and login invalidation',()=>{const {store,users}=setup(2);const u=users[0];assert.ok(verifyPassword('test-password-123',u.password));assert.ok(!verifyPassword('wrong',u.password));const a=store.login(u),b=store.login(u);assert.equal(store.session(a),undefined);assert.equal(store.session(b)?.id,u.id);store.db.close();});
 test('duplicate requests do not debit twice; stale requests rejected; host required',()=>{
   const {store,room,users,cmd}=setup(2),id=users[0].id,key=crypto.randomUUID(),version=room.state.version;

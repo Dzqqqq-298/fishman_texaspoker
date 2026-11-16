@@ -29,6 +29,11 @@ test('real HTTP + 11 WebSocket clients: authentication, private cards, complete 
     for(let i=0;i<11;i++){
       const socket=io(base,{transports:['websocket'],extraHeaders:{Origin:base,Cookie:cookies[i]},reconnection:false});sockets.push(socket);socket.on('state',(s:RoomView)=>states.set(i,s));
       await until(()=>states.has(i));
+      if(i===0){
+        const before=states.get(i)!;assert.equal(before.match,null);
+        const created=await socket.timeout(5000).emitWithAck('command',{key:crypto.randomUUID(),version:before.version,type:'createRoom',data:{name:'十一人好友局',durationMinutes:60}});
+        assert.ok(created.ok,created.error);await until(()=>!!states.get(i)!.match);
+      }
       const state=states.get(i)!;
       const ack=await socket.timeout(5000).emitWithAck('command',{key:crypto.randomUUID(),version:state.version,type:'sit',data:{amount:2000}});assert.ok(ack.ok,ack.error);
       await until(()=>states.get(i)!.seats.length===i+1);
@@ -53,9 +58,17 @@ test('real HTTP + 11 WebSocket clients: authentication, private cards, complete 
     const result=states.get(0)!;assert.equal(result.seats.reduce((n,p)=>n+p.stack,0),22000);assert.equal(result.running,false);
     const id=result.me.id;sockets[0].disconnect();
     const reconnected=io(base,{transports:['websocket'],extraHeaders:{Origin:base,Cookie:cookies[0]},reconnection:false});sockets.push(reconnected);
-    let restored:RoomView|undefined;reconnected.on('state',(s:RoomView)=>restored=s);await until(()=>!!restored);
+    let restored:RoomView|undefined;reconnected.on('state',(s:RoomView)=>{restored=s;states.set(0,s);});await until(()=>!!restored);
     assert.equal(restored!.me.id,id);assert.equal(restored!.hand!.id,result.hand!.id);
     assert.equal(restored!.seats.length,11);
+    sockets[0]=reconnected;
+    await send(0,'endRoom');
+    assert.ok([...states.values()].every(s=>s.match===null&&s.seats.length===0));
+    assert.equal(states.get(0)!.recentMatches[0].handCount,1);
+    assert.equal(states.get(0)!.recentMatches[0].players.reduce((n,p)=>n+p.profit,0),0);
+    assert.equal([...states.values()].reduce((n,s)=>n+s.me.balance,0),1100000);
+    await send(0,'createRoom',{name:'下一场',durationMinutes:0,maxPlayers:6});
+    assert.ok([...states.values()].every(s=>s.match?.name==='下一场'&&s.config.maxPlayers===6));
   } finally {
     sockets.forEach(s=>s.disconnect());child.kill();await until(()=>child.exitCode!==null||child.signalCode!==null).catch(()=>{});
     const rel=relative(resolve(tmpdir()),resolve(folder));

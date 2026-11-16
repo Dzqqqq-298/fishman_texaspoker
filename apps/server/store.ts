@@ -2,6 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomBytes, scryptSync, timingSafeEqual, createHash } from 'node:crypto';
+import type { MatchResult } from '../../packages/game-engine/room-config';
 
 export type User = { id:number; username:string; name:string; password:string; admin:number; balance:number; timeCards:number; hands:number };
 export function hashPassword(password:string) {const salt=randomBytes(16).toString('hex');return `${salt}:${scryptSync(password,salt,64).toString('hex')}`;}
@@ -18,6 +19,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS room(id INTEGER PRIMARY KEY CHECK(id=1),state TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS ledger(id INTEGER PRIMARY KEY,userId INTEGER NOT NULL REFERENCES users(id),amount INTEGER NOT NULL,kind TEXT NOT NULL,at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
       CREATE TABLE IF NOT EXISTS hands(id TEXT PRIMARY KEY,summary TEXT NOT NULL,at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+      CREATE TABLE IF NOT EXISTS matches(id TEXT PRIMARY KEY,summary TEXT NOT NULL,endedAt INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS commands(userId INTEGER NOT NULL,key TEXT NOT NULL,at INTEGER NOT NULL,PRIMARY KEY(userId,key));`);
   }
   users() {return this.db.prepare('SELECT * FROM users ORDER BY id').all() as User[];}
@@ -45,6 +47,8 @@ export class Store {
   }
   record(id:number,amount:number,kind:string) {this.db.prepare('INSERT INTO ledger(userId,amount,kind) VALUES(?,?,?)').run(id,amount,kind);}
   recent(id:number) {return this.db.prepare('SELECT amount,kind,at FROM ledger WHERE userId=? ORDER BY id DESC LIMIT 30').all();}
+  saveMatch(result:MatchResult) {this.db.prepare('INSERT INTO matches VALUES(?,?,?)').run(result.id,JSON.stringify(result),result.endedAt);}
+  recentMatches():MatchResult[] {return (this.db.prepare('SELECT summary FROM matches ORDER BY endedAt DESC, rowid DESC LIMIT 5').all() as {summary:string}[]).map(r=>JSON.parse(r.summary));}
   load<T>() {const row=this.db.prepare('SELECT state FROM room WHERE id=1').get() as {state:string}|undefined;return row?JSON.parse(row.state) as T:null;}
   save(state:unknown) {this.db.prepare('INSERT INTO room VALUES(1,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state').run(JSON.stringify(state));}
   transaction<T>(fn:()=>T) {this.db.exec('BEGIN IMMEDIATE');try{const result=fn();this.db.exec('COMMIT');return result;}catch(error){this.db.exec('ROLLBACK');throw error;}}
